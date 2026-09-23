@@ -44,8 +44,8 @@ jobs:
             -DCMAKE_CXX_COMPILER="$(xcrun -f clang++)" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
-            -DCMAKE_C_FLAGS=-fno-stack-protector \
-            -DCMAKE_CXX_FLAGS=-fno-stack-protector \
+            "-DCMAKE_C_FLAGS=-fno-stack-protector -DFEX_IOS_HOST=1" \
+            "-DCMAKE_CXX_FLAGS=-fno-stack-protector -DFEX_IOS_HOST=1" \
             -DCMAKE_DISABLE_FIND_PACKAGE_fmt=ON \
             -DCMAKE_DISABLE_FIND_PACKAGE_unordered_dense=ON \
             -DCMAKE_DISABLE_FIND_PACKAGE_range-v3=ON \
@@ -78,7 +78,7 @@ jobs:
 
       - name: Empacotar bibliotecas e cabecalhos gerados
         run: |
-          find FEX/build-ios -type f \( -name '*.a' -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' \) -print0 \
+          find FEX/build-ios -type f \( -name '*.a' -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.inl' \) -print0 \
             | tar -czf fex-ios.tar.gz --null -T -
           echo 'Bibliotecas estaticas do FEX compiladas para iOS arm64. Ainda nao foi gerado nem testado um IPA.' >> "$GITHUB_STEP_SUMMARY"
 
