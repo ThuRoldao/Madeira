@@ -1,0 +1,131 @@
+name: Compilar LLVM para DXMT
+
+on:
+  push:
+    branches: [diagnostico-wow64]
+    paths:
+      - .github/workflows/compilar-llvm-ios.yml
+
+permissions:
+  contents: read
+
+jobs:
+  llvm:
+    runs-on: macos-15
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Baixar Madeira
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Preparar ferramentas e fontes LLVM 15.0.7
+        run: |
+          mkdir -p reports toolchains
+          git rev-parse HEAD | tee reports/madeira-commit.txt
+          xcodebuild -version | tee reports/xcode.txt
+          brew install cmake ninja 2>&1 | tee reports/ferramentas.log
+          git clone --depth 1 --filter=blob:none --sparse --single-branch \
+            --branch llvmorg-15.0.7 https://github.com/llvm/llvm-project.git toolchains/llvm-project
+          git -C toolchains/llvm-project sparse-checkout set llvm cmake third-party
+          git -C toolchains/llvm-project rev-parse HEAD | tee reports/llvm-commit.txt
+          df -h .
+
+      - name: Configurar gerador LLVM para o Mac
+        run: |
+          cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-host-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DLLVM_TARGETS_TO_BUILD= -DLLVM_ENABLE_PROJECTS= \
+            -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_DOCS=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_ZSTD=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_ENABLE_LIBXML2=OFF \
+            2>&1 | tee reports/llvm-host-configure.log
+
+      - name: Compilar gerador LLVM para o Mac
+        run: |
+          cmake --build toolchains/llvm-host-build --target llvm-tblgen --parallel 3 \
+            2>&1 | tee reports/llvm-host-build.log
+          toolchains/llvm-host-build/bin/llvm-tblgen --version
+
+      - name: Aplicar ajuste iOS documentado pelo Madeira
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import difflib
+          p = Path('toolchains/llvm-project/llvm/cmake/modules/AddLLVM.cmake')
+          s = p.read_text()
+          old = 'if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")\n        # ld64'
+          new = 'if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin|iOS")\n        # ld64'
+          if s.count(old) != 1:
+              raise SystemExit('Trecho esperado do AddLLVM.cmake nao encontrado uma unica vez')
+          updated = s.replace(old, new, 1)
+          p.write_text(updated)
+          diff = ''.join(difflib.unified_diff(s.splitlines(True), updated.splitlines(True), fromfile='a/llvm/cmake/modules/AddLLVM.cmake', tofile='b/llvm/cmake/modules/AddLLVM.cmake'))
+          Path('reports/llvm-ios.patch').write_text(diff)
+          print(diff)
+          PY
+
+      - name: Configurar bibliotecas LLVM para iOS
+        run: |
+          cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-ios-build -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_SYSTEM_PROCESSOR=arm64 \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=18.0 \
+            -DCMAKE_OSX_SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+            -DCMAKE_C_COMPILER="$(xcrun -f clang)" \
+            -DCMAKE_CXX_COMPILER="$(xcrun -f clang++)" \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DLLVM_TABLEGEN="$GITHUB_WORKSPACE/toolchains/llvm-host-build/bin/llvm-tblgen" \
+            -DLLVM_TARGETS_TO_BUILD= -DLLVM_ENABLE_PROJECTS= \
+            -DLLVM_DEFAULT_TARGET_TRIPLE=aarch64-apple-ios18.0 \
+            -DLLVM_BUILD_TOOLS=OFF -DLLVM_INCLUDE_TOOLS=OFF \
+            -DLLVM_BUILD_UTILS=OFF -DLLVM_INCLUDE_UTILS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_DOCS=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_ZSTD=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_ENABLE_LIBXML2=OFF \
+            -DLLVM_ENABLE_LIBEDIT=OFF -DLLVM_ENABLE_BINDINGS=OFF \
+            -DLLVM_ENABLE_RTTI=OFF -DLLVM_ENABLE_EH=OFF \
+            -DLLVM_BUILD_LLVM_DYLIB=OFF -DBUILD_SHARED_LIBS=OFF \
+            2>&1 | tee reports/llvm-ios-configure.log
+
+      - name: Compilar bibliotecas LLVM para iOS
+        run: |
+          cmake --build toolchains/llvm-ios-build --parallel 3 \
+            2>&1 | tee reports/llvm-ios-build.log
+          for lib in LLVMCore LLVMSupport LLVMBitWriter LLVMPasses; do
+            test -s "toolchains/llvm-ios-build/lib/lib${lib}.a"
+            xcrun lipo -info "toolchains/llvm-ios-build/lib/lib${lib}.a"
+          done
+
+      - name: Empacotar LLVM para uso pelo DXMT
+        run: |
+          tar -czf llvm-ios.tar.gz \
+            toolchains/llvm-ios-build/lib \
+            toolchains/llvm-ios-build/include \
+            toolchains/llvm-project/llvm/include
+          echo 'LLVM 15.0.7 compilado para iOS arm64. Proximo passo: biblioteca DXMT. Ainda nao e um IPA.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Salvar LLVM compilado
+        uses: actions/upload-artifact@v7
+        with:
+          name: llvm-ios
+          path: llvm-ios.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Salvar relatorios mesmo em caso de erro
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: relatorios-llvm-ios
+          retention-days: 7
+          path: |
+            reports/
+            toolchains/llvm-host-build/CMakeCache.txt
+            toolchains/llvm-host-build/CMakeFiles/CMakeConfigureLog.yaml
+            toolchains/llvm-ios-build/CMakeCache.txt
+            toolchains/llvm-ios-build/CMakeFiles/CMakeConfigureLog.yaml
