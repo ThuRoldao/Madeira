@@ -1,0 +1,61 @@
+name: Verificar ambiente Mac
+
+on:
+  push:
+    branches:
+      - diagnostico-wow64
+    paths:
+      - .github/workflows/verificar-mac.yml
+
+permissions:
+  contents: read
+
+jobs:
+  verificar:
+    runs-on: macos-15
+    timeout-minutes: 25
+
+    steps:
+      - name: Conferir ferramentas do Mac
+        run: |
+          uname -m
+          sw_vers
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          df -h .
+
+      - name: Baixar Madeira e dependencias
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Conferir codigo de diagnostico
+        run: |
+          git rev-parse HEAD
+          git submodule status --recursive
+          grep -n 'wow64-diag-v1' build/ntdll-unix/env_ios.c
+
+      - name: Identificar arquivos presentes e ausentes
+        run: |
+          for item in \
+            wine/build-macos/include/config.h \
+            wine/build-arm64ec/include \
+            FEX/build-ios/FEXCore/Source/libFEXCore.a \
+            app/Madeira/libntdll_unix.a \
+            app/Madeira/libwineserver.a \
+            app/Madeira/libwin32u_unix.a \
+            app/Madeira/libdxmt_combined.a \
+            app/Madeira/prefix-template.tar.gz \
+            research/freetype \
+            toolchains/gnutls-ios/include
+          do
+            if [ -e "$item" ]; then
+              printf 'PRESENTE: %s\n' "$item"
+            else
+              printf 'AUSENTE: %s\n' "$item"
+            fi
+          done
+
+      - name: Conferir projeto Xcode
+        run: xcodebuild -list -project app/Madeira.xcodeproj
