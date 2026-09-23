@@ -1912,8 +1912,17 @@ static void *build_wow64_parameters( const RTL_USER_PROCESS_PARAMETERS *params )
                    + ((params->RuntimeInfo.MaximumLength + 1) & ~1)
                    + params->EnvironmentSize);
 
+    dprintf( 2, "[wow64-diag-v1] before alloc: requested=0x%llx zero_bits=0x%llx\n",
+             (unsigned long long)size,
+             (unsigned long long)(limit_2g - 1) );
+
     status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&wow64_params, limit_2g - 1, &size,
                                       MEM_COMMIT, PAGE_READWRITE );
+
+    dprintf( 2, "[wow64-diag-v1] after alloc: status=0x%08x base=%p size=0x%llx\n",
+             (unsigned int)status, (void *)wow64_params,
+             (unsigned long long)size );
+
     assert( !status );
 
     wow64_params->AllocationSize  = size;
