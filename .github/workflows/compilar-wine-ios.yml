@@ -1,0 +1,176 @@
+name: Compilar Wine ntdll e win32u
+
+on:
+  push:
+    branches: [diagnostico-wow64]
+    paths:
+      - .github/workflows/compilar-wine-ios.yml
+      - build/ntdll-unix/env_ios.c
+
+permissions:
+  contents: read
+
+jobs:
+  compilar-env:
+    runs-on: macos-15
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Baixar Madeira e Wine
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Preparar ferramentas
+        run: |
+          mkdir -p reports toolchains
+          git rev-parse HEAD | tee reports/commit.txt
+          git submodule status --recursive | tee reports/submodules.txt
+          xcodebuild -version | tee reports/xcode.txt
+          brew install bison flex pkgconf cmake autoconf automake libtool gettext 2>&1 | tee reports/ferramentas.log
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix gettext)/bin" >> "$GITHUB_PATH"
+
+      - name: Baixar compilador Windows usado pelo projeto
+        run: |
+          curl --fail --location --retry 3 \
+            https://github.com/mstorsjo/llvm-mingw/releases/download/20260421/llvm-mingw-20260421-ucrt-macos-universal.tar.xz \
+            -o toolchains/llvm-mingw.tar.xz
+          tar -xJf toolchains/llvm-mingw.tar.xz -C toolchains
+          echo "$GITHUB_WORKSPACE/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin" >> "$GITHUB_PATH"
+
+      - name: Gerar configuracao do Wine
+        run: |
+          mkdir -p wine/build-macos
+          cd wine/build-macos
+          CC=/usr/bin/clang CXX=/usr/bin/clang++ \
+            ../configure --enable-win64 --enable-archs=aarch64 \
+            --disable-tests --without-x --without-wayland \
+            --without-gstreamer --without-vulkan \
+            2>&1 | tee "$GITHUB_WORKSPACE/reports/wine-configure.log"
+          test -s include/config.h
+
+      - name: Gerar ferramentas e cabecalhos do Wine
+        run: |
+          make -C wine/build-macos -j3 __tooldeps__ include/all \
+            2>&1 | tee reports/wine-headers.log
+
+      - name: Preparar cabecalhos ARM64EC
+        run: |
+          mkdir -p wine/build-arm64ec
+          cd wine/build-arm64ec
+          CC=/usr/bin/clang CXX=/usr/bin/clang++ \
+            ../configure --enable-win64 --enable-archs=arm64ec \
+            --with-wine-tools="$GITHUB_WORKSPACE/wine/build-macos" \
+            --disable-tests --without-x --without-wayland \
+            --without-gstreamer --without-vulkan \
+            2>&1 | tee "$GITHUB_WORKSPACE/reports/arm64ec-configure.log"
+          make -j3 include/all 2>&1 | tee "$GITHUB_WORKSPACE/reports/arm64ec-headers.log"
+          test -s include/dwrite.h
+
+      - name: Preparar FreeType
+        run: |
+          git clone --depth 1 --branch VER-2-13-3 https://github.com/freetype/freetype.git research/freetype
+          bash build/freetype-ios/build.sh 2>&1 | tee reports/freetype.log
+
+      - name: Conferir fontes de criptografia
+        working-directory: build/gnutls-ios/src
+        run: shasum -a 256 -c SHA256SUMS
+
+      - name: Preparar GnuTLS
+        run: |
+          bash build/gnutls-ios/build.sh 2>&1 | tee reports/gnutls.log
+          test -s toolchains/gnutls-ios/include/gnutls/gnutls.h
+
+      - name: Compilar env_ios com o diagnostico
+        run: |
+          mkdir -p build/ntdll-unix/obj
+          grep -n 'wow64-diag-v1' build/ntdll-unix/env_ios.c
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun -sdk iphoneos clang \
+            -arch arm64 -isysroot "$SDK" -miphoneos-version-min=17.0 \
+            -O2 -fPIC -fvisibility=hidden -fno-stack-protector -fno-strict-aliasing \
+            -Wno-implicit-function-declaration -Wno-int-conversion \
+            -include wine/build-macos/include/config.h \
+            -include build/ntdll-unix/shims/wine_ios_exit.h \
+            -Ibuild/ntdll-unix/shims \
+            -Iwine/build-macos/dlls/ntdll -Iwine/dlls/ntdll -Iwine/dlls/ntdll/unix \
+            -Iwine/build-macos/include -Iwine/include \
+            -D__WINESRC__ -DLTC_NO_PROTOTYPES -DLTC_SOURCE -D_NTSYSTEM_ \
+            -D_ACRTIMP= -DWINBASEAPI= \
+            '-DBINDIR="/usr/local/bin"' '-DLIBDIR="/usr/local/lib"' \
+            '-DDATADIR="/usr/local/share"' '-DSYSTEMDLLPATH=""' \
+            -DWINE_UNIX_LIB -DWINE_IOS=1 \
+            -Dget_thread_context=ntdll_get_thread_context \
+            -Dset_thread_context=ntdll_set_thread_context \
+            -c build/ntdll-unix/env_ios.c -o build/ntdll-unix/obj/env.o \
+            2>&1 | tee reports/env-ios.log
+          test -s build/ntdll-unix/obj/env.o
+          file build/ntdll-unix/obj/env.o | tee reports/env-object.txt
+          strings build/ntdll-unix/obj/env.o | grep 'wow64-diag-v1' | tee reports/diagnostico.txt
+          echo 'env_ios.c compilado para iOS arm64 com as mensagens de diagnostico. Isto nao e um IPA nem um teste no iPad.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Compilar biblioteca ntdll completa
+        run: |
+          bash build/ntdll-unix/build.sh 2>&1 | tee reports/ntdll.log
+          test -s app/Madeira/libntdll_unix.a
+          xcrun lipo -info app/Madeira/libntdll_unix.a | tee reports/ntdll-arquitetura.txt
+          ar -t app/Madeira/libntdll_unix.a | tee reports/ntdll-objetos.txt
+          grep -Fx 'env.o' reports/ntdll-objetos.txt
+          strings build/ntdll-unix/obj/env.o | grep 'wow64-diag-v1' | tee reports/diagnostico.txt
+          echo 'Biblioteca ntdll compilada com o diagnostico WoW64. Ainda nao e um IPA.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Compilar biblioteca win32u
+        run: |
+          test -s build/freetype-ios/build/libfreetype.a
+          bash build/win32u-unix/build.sh 2>&1 | tee reports/win32u.log
+          test -s app/Madeira/libwin32u_unix.a
+          xcrun lipo -info app/Madeira/libwin32u_unix.a | tee reports/win32u-arquitetura.txt
+          ar -t app/Madeira/libwin32u_unix.a > reports/win32u-objetos.txt
+          echo 'ntdll e win32u compiladas para iOS. Ainda faltam wineserver, DXMT e a montagem do aplicativo.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Empacotar bibliotecas compiladas
+        run: |
+          tar -czf wine-ntdll-win32u-ios.tar.gz \
+            app/Madeira/libntdll_unix.a \
+            app/Madeira/libwin32u_unix.a \
+            toolchains/gnutls-ios \
+            research/freetype/include \
+            build/freetype-ios/build/libfreetype.a
+
+      - name: Salvar bibliotecas
+        uses: actions/upload-artifact@v7
+        with:
+          name: wine-ntdll-win32u-ios
+          path: wine-ntdll-win32u-ios.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Salvar objeto de diagnostico
+        uses: actions/upload-artifact@v7
+        with:
+          name: env-ios-objeto
+          path: build/ntdll-unix/obj/env.o
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Salvar relatorios mesmo em caso de erro
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: relatorios-wine-ios
+          retention-days: 7
+          path: |
+            reports/
+            wine/build-macos/config.log
+            wine/build-macos/include/config.h
+            wine/build-arm64ec/config.log
+            build/ntdll-unix/obj/*.err
+            build/gnutls-ios/obj/*-configure.log
+            build/gnutls-ios/obj/*-make.log
+            build/gnutls-ios/obj/**/config.log
+            build/win32u-unix/obj/*.err
