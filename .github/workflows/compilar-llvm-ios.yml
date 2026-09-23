@@ -94,11 +94,24 @@ jobs:
 
       - name: Compilar bibliotecas LLVM para iOS
         run: |
-          cmake --build toolchains/llvm-ios-build --parallel 3 \
+          # Bibliotecas listadas em research/dxmt/src/airconv/meson.build.
+          # Alvos explicitos evitam compilar o plugin de exemplo LLVMHello.
+          libs=(
+            LLVMPasses LLVMTarget LLVMObjCARCOpts LLVMCoroutines LLVMipo
+            LLVMInstrumentation LLVMVectorize LLVMLinker LLVMIRReader LLVMAsmParser
+            LLVMFrontendOpenMP LLVMScalarOpts LLVMInstCombine LLVMAggressiveInstCombine
+            LLVMTransformUtils LLVMBitWriter LLVMAnalysis LLVMProfileData LLVMSymbolize
+            LLVMDebugInfoPDB LLVMDebugInfoMSF LLVMDebugInfoDWARF LLVMObject LLVMTextAPI
+            LLVMMCParser LLVMMC LLVMDebugInfoCodeView LLVMBitReader LLVMCore LLVMRemarks
+            LLVMBitstreamReader LLVMBinaryFormat LLVMSupport LLVMDemangle
+          )
+          printf '%s\n' "${libs[@]}" > reports/llvm-bibliotecas.txt
+          cmake --build toolchains/llvm-ios-build --parallel 3 --target "${libs[@]}" \
             2>&1 | tee reports/llvm-ios-build.log
-          for lib in LLVMCore LLVMSupport LLVMBitWriter LLVMPasses; do
+          for lib in "${libs[@]}"; do
             test -s "toolchains/llvm-ios-build/lib/lib${lib}.a"
-            xcrun lipo -info "toolchains/llvm-ios-build/lib/lib${lib}.a"
+            xcrun lipo -verify_arch arm64 "toolchains/llvm-ios-build/lib/lib${lib}.a"
+            xcrun lipo -info "toolchains/llvm-ios-build/lib/lib${lib}.a" | tee -a reports/llvm-arquiteturas.txt
           done
 
       - name: Empacotar LLVM para uso pelo DXMT
