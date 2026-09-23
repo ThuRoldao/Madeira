@@ -32,6 +32,25 @@ jobs:
           brew install cmake ninja 2>&1 | tee reports/ferramentas.log
           python3 --version
 
+      - name: Adaptar consulta de diagnostico para a plataforma
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import difflib
+          p = Path("FEX/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp")
+          s = p.read_text(encoding="utf-8")
+          old = '  MEMORY_BASIC_INFORMATION mbi {};\n  const char* type = "?";\n  if (VirtualQuery(reinterpret_cast<LPCVOID>(GPRs[AddressReg]), &mbi, sizeof(mbi))) {\n    type = mbi.Type == MEM_IMAGE ? "MEM_IMAGE" : mbi.Type == MEM_MAPPED ? "MEM_MAPPED" : "MEM_PRIVATE";\n  }\n  LogMan::Msg::EFmt("[caspal128] MISALIGNED-UNSUPPORTED Size={} addrReg=x{} addr={:#x} misalign={} "\n                    "crosses16B={} | region base={} size={:#x} prot={:#x} type={} state={:#x}",\n                    Size, AddressReg, GPRs[AddressReg], GPRs[AddressReg] & 15,\n                    (GPRs[AddressReg] & 15) ? "yes" : "no", mbi.BaseAddress, mbi.RegionSize,\n                    mbi.Protect, type, mbi.State);'
+          new = '#ifdef _WIN32\n  MEMORY_BASIC_INFORMATION mbi {};\n  const char* type = "?";\n  if (VirtualQuery(reinterpret_cast<LPCVOID>(GPRs[AddressReg]), &mbi, sizeof(mbi))) {\n    type = mbi.Type == MEM_IMAGE ? "MEM_IMAGE" : mbi.Type == MEM_MAPPED ? "MEM_MAPPED" : "MEM_PRIVATE";\n  }\n  LogMan::Msg::EFmt("[caspal128] MISALIGNED-UNSUPPORTED Size={} addrReg=x{} addr={:#x} misalign={} "\n                    "crosses16B={} | region base={} size={:#x} prot={:#x} type={} state={:#x}",\n                    Size, AddressReg, GPRs[AddressReg], GPRs[AddressReg] & 15,\n                    (GPRs[AddressReg] & 15) ? "yes" : "no", mbi.BaseAddress, mbi.RegionSize,\n                    mbi.Protect, type, mbi.State);\n#else\n  LogMan::Msg::EFmt("[caspal128] MISALIGNED-UNSUPPORTED Size={} addrReg=x{} addr={:#x} misalign={} "\n                    "| region query unavailable on this platform",\n                    Size, AddressReg, GPRs[AddressReg], GPRs[AddressReg] & 15);\n#endif'
+          if s.count(old) != 1:
+              raise SystemExit("Trecho esperado nao encontrado uma unica vez; ajuste interrompido.")
+          updated = s.replace(old, new, 1)
+          p.write_text(updated, encoding="utf-8")
+          patch = "".join(difflib.unified_diff(s.splitlines(True), updated.splitlines(True), fromfile="a/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp", tofile="b/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp"))
+          Path("reports/fex-diagnostico-plataforma.patch").write_text(patch, encoding="utf-8")
+          print("Consulta VirtualQuery limitada ao alvo Windows; mensagem nativa preservada.")
+          PY
+          git -C FEX diff --check
+
       - name: Configurar FEX para iOS arm64
         run: |
           cmake -S FEX -B FEX/build-ios -G Ninja \
