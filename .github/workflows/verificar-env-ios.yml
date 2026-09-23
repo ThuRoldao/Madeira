@@ -1,0 +1,106 @@
+name: Compilar diagnostico env_ios
+
+on:
+  push:
+    branches: [diagnostico-wow64]
+    paths:
+      - .github/workflows/verificar-env-ios.yml
+      - build/ntdll-unix/env_ios.c
+
+permissions:
+  contents: read
+
+jobs:
+  compilar-env:
+    runs-on: macos-15
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Baixar Madeira e Wine
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Preparar ferramentas
+        run: |
+          mkdir -p reports toolchains
+          git rev-parse HEAD | tee reports/commit.txt
+          git submodule status --recursive | tee reports/submodules.txt
+          xcodebuild -version | tee reports/xcode.txt
+          brew install bison flex pkgconf 2>&1 | tee reports/ferramentas.log
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
+
+      - name: Baixar compilador Windows usado pelo projeto
+        run: |
+          curl --fail --location --retry 3 \
+            https://github.com/mstorsjo/llvm-mingw/releases/download/20260421/llvm-mingw-20260421-ucrt-macos-universal.tar.xz \
+            -o toolchains/llvm-mingw.tar.xz
+          tar -xJf toolchains/llvm-mingw.tar.xz -C toolchains
+          echo "$GITHUB_WORKSPACE/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin" >> "$GITHUB_PATH"
+
+      - name: Gerar configuracao do Wine
+        run: |
+          mkdir -p wine/build-macos
+          cd wine/build-macos
+          CC=/usr/bin/clang CXX=/usr/bin/clang++ \
+            ../configure --enable-win64 --enable-archs=aarch64 \
+            --disable-tests --without-x --without-wayland \
+            --without-gstreamer --without-vulkan \
+            2>&1 | tee "$GITHUB_WORKSPACE/reports/wine-configure.log"
+          test -s include/config.h
+
+      - name: Gerar ferramentas e cabecalhos do Wine
+        run: |
+          make -C wine/build-macos -j3 __tooldeps__ include/all \
+            2>&1 | tee reports/wine-headers.log
+
+      - name: Compilar env_ios com o diagnostico
+        run: |
+          mkdir -p build/ntdll-unix/obj
+          grep -n 'wow64-diag-v1' build/ntdll-unix/env_ios.c
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun -sdk iphoneos clang \
+            -arch arm64 -isysroot "$SDK" -miphoneos-version-min=17.0 \
+            -O2 -fPIC -fvisibility=hidden -fno-stack-protector -fno-strict-aliasing \
+            -Wno-implicit-function-declaration -Wno-int-conversion \
+            -include wine/build-macos/include/config.h \
+            -include build/ntdll-unix/shims/wine_ios_exit.h \
+            -Ibuild/ntdll-unix/shims \
+            -Iwine/build-macos/dlls/ntdll -Iwine/dlls/ntdll -Iwine/dlls/ntdll/unix \
+            -Iwine/build-macos/include -Iwine/include \
+            -D__WINESRC__ -DLTC_NO_PROTOTYPES -DLTC_SOURCE -D_NTSYSTEM_ \
+            -D_ACRTIMP= -DWINBASEAPI= \
+            '-DBINDIR="/usr/local/bin"' '-DLIBDIR="/usr/local/lib"' \
+            '-DDATADIR="/usr/local/share"' '-DSYSTEMDLLPATH=""' \
+            -DWINE_UNIX_LIB -DWINE_IOS=1 \
+            -Dget_thread_context=ntdll_get_thread_context \
+            -Dset_thread_context=ntdll_set_thread_context \
+            -c build/ntdll-unix/env_ios.c -o build/ntdll-unix/obj/env.o \
+            2>&1 | tee reports/env-ios.log
+          test -s build/ntdll-unix/obj/env.o
+          file build/ntdll-unix/obj/env.o | tee reports/env-object.txt
+          strings build/ntdll-unix/obj/env.o | grep 'wow64-diag-v1' | tee reports/diagnostico.txt
+          echo 'env_ios.c compilado para iOS arm64 com as mensagens de diagnostico. Isto nao e um IPA nem um teste no iPad.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Salvar objeto de diagnostico
+        uses: actions/upload-artifact@v7
+        with:
+          name: env-ios-objeto
+          path: build/ntdll-unix/obj/env.o
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Salvar relatorios mesmo em caso de erro
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: relatorios-env-ios
+          retention-days: 7
+          path: |
+            reports/
+            wine/build-macos/config.log
+            wine/build-macos/include/config.h
