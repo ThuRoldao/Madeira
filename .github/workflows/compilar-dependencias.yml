@@ -1,0 +1,84 @@
+name: Compilar dependencias iOS
+
+on:
+  push:
+    branches: [diagnostico-wow64]
+    paths:
+      - .github/workflows/compilar-dependencias.yml
+
+permissions:
+  contents: read
+
+jobs:
+  dependencias:
+    runs-on: macos-15
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Baixar Madeira
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Preparar ferramentas
+        run: |
+          mkdir -p reports
+          git rev-parse HEAD | tee reports/commit.txt
+          xcodebuild -version | tee reports/xcode.txt
+          brew install cmake pkgconf autoconf automake libtool gettext 2>&1 | tee reports/ferramentas.log
+          echo "$(brew --prefix gettext)/bin" >> "$GITHUB_PATH"
+
+      - name: Baixar FreeType 2.13.3
+        run: |
+          git clone --depth 1 --branch VER-2-13-3 https://github.com/freetype/freetype.git research/freetype
+          git -C research/freetype rev-parse HEAD | tee reports/freetype-commit.txt
+
+      - name: Compilar FreeType para iOS
+        run: |
+          bash build/freetype-ios/build.sh 2>&1 | tee reports/freetype.log
+          test -s build/freetype-ios/build/libfreetype.a
+          xcrun lipo -info build/freetype-ios/build/libfreetype.a
+
+      - name: Conferir fontes de criptografia
+        working-directory: build/gnutls-ios/src
+        run: shasum -a 256 -c SHA256SUMS
+
+      - name: Compilar GnuTLS para iOS
+        run: |
+          bash build/gnutls-ios/build.sh 2>&1 | tee reports/gnutls.log
+          test -s toolchains/gnutls-ios/include/gnutls/gnutls.h
+          for lib in gmp nettle hogweed gnutls; do
+            test -s "toolchains/gnutls-ios/lib/lib${lib}.a"
+            xcrun lipo -info "toolchains/gnutls-ios/lib/lib${lib}.a"
+          done
+
+      - name: Empacotar dependencias compiladas
+        run: |
+          tar -czf dependencias-ios.tar.gz \
+            toolchains/gnutls-ios \
+            research/freetype/include \
+            build/freetype-ios/build/libfreetype.a
+          echo 'FreeType e GnuTLS compilados. Madeira e IPA ainda nao foram compilados.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Salvar dependencias
+        uses: actions/upload-artifact@v7
+        with:
+          name: dependencias-ios
+          path: dependencias-ios.tar.gz
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Salvar relatorios mesmo em caso de erro
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: relatorios-dependencias
+          retention-days: 7
+          path: |
+            reports/
+            build/gnutls-ios/obj/*-configure.log
+            build/gnutls-ios/obj/*-make.log
+            build/gnutls-ios/obj/**/config.log
+            build/freetype-ios/build/CMakeFiles/CMakeConfigureLog.yaml
