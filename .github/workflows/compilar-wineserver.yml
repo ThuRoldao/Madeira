@@ -1,0 +1,145 @@
+name: Compilar wineserver iOS
+
+on:
+  push:
+    branches: [diagnostico-wow64]
+    paths:
+      - .github/workflows/compilar-wineserver.yml
+
+permissions:
+  contents: read
+
+jobs:
+  compilar-env:
+    runs-on: macos-15
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Baixar Madeira e Wine
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Preparar ferramentas
+        run: |
+          mkdir -p reports toolchains
+          git rev-parse HEAD | tee reports/commit.txt
+          git submodule status --recursive | tee reports/submodules.txt
+          xcodebuild -version | tee reports/xcode.txt
+          brew install bison flex pkgconf 2>&1 | tee reports/ferramentas.log
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
+
+      - name: Baixar compilador Windows usado pelo projeto
+        run: |
+          curl --fail --location --retry 3 \
+            https://github.com/mstorsjo/llvm-mingw/releases/download/20260421/llvm-mingw-20260421-ucrt-macos-universal.tar.xz \
+            -o toolchains/llvm-mingw.tar.xz
+          tar -xJf toolchains/llvm-mingw.tar.xz -C toolchains
+          echo "$GITHUB_WORKSPACE/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin" >> "$GITHUB_PATH"
+
+      - name: Gerar configuracao do Wine
+        run: |
+          mkdir -p wine/build-macos
+          cd wine/build-macos
+          CC=/usr/bin/clang CXX=/usr/bin/clang++ \
+            ../configure --enable-win64 --enable-archs=aarch64 \
+            --disable-tests --without-x --without-wayland \
+            --without-gstreamer --without-vulkan \
+            2>&1 | tee "$GITHUB_WORKSPACE/reports/wine-configure.log"
+          test -s include/config.h
+
+      - name: Gerar ferramentas e cabecalhos do Wine
+        run: |
+          make -C wine/build-macos -j3 __tooldeps__ include/all \
+            2>&1 | tee reports/wine-headers.log
+
+      - name: Preparar compilacao inicial do wineserver
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          original = Path("build/wineserver/build.sh").read_text()
+          begin = original.index("CC_FLAGS=(")
+          end = original.index('echo "=== Building kill wrapper')
+          setup = original[:original.index("# Copy the base library")]
+          setup += original[begin:end]
+          makefile = Path("wine/server/Makefile.in").read_text()
+          sources = re.findall(r"^\s*([A-Za-z0-9_]+\.c)(?:\s|$)", makefile, re.M)
+          if not sources or len(sources) != len(set(sources)):
+              raise SystemExit("Lista de fontes do wineserver invalida")
+          missing = [s for s in sources if not (Path("wine/server") / s).is_file()]
+          if missing:
+              raise SystemExit(f"Fontes ausentes: {missing}")
+          Path("reports/wineserver-fontes.txt").write_text("\n".join(sources) + "\n")
+          setup += "\n" + r'''
+          # First compile only files not replaced by the project's iOS script.
+          BASE_OBJECTS=()
+          while IFS= read -r source; do
+              name="${source%.c}"
+              patched=0
+              for entry in "${PATCHED_FILES[@]}"; do
+                  old_object="${entry##*:}"
+                  if [[ "$old_object" == "$name.o" ]]; then
+                      patched=1
+                      break
+                  fi
+              done
+              if [[ "$patched" == 1 ]]; then
+                  echo "iOS replacement scheduled: $source"
+                  continue
+              fi
+              compile_one "$WINE_SRC/server/$source" "$name"
+              BASE_OBJECTS+=("$OBJ_DIR/$name.o")
+          done < "$REPO_ROOT/reports/wineserver-fontes.txt"
+          if [[ "${#BASE_OBJECTS[@]}" == 0 ]]; then
+              echo "ERROR: no base objects were compiled"
+              exit 1
+          fi
+          ar rcs "$OBJ_DIR/libwineserver.a" "${BASE_OBJECTS[@]}"
+          echo "Base archive created; the iOS replacements must still be compiled."
+          '''
+          Path("build/wineserver/bootstrap-ci.sh").write_text(setup)
+          Path("reports/bootstrap-ci.sh").write_text(setup)
+          print(f"Preparacao criada para {len(sources)} fontes, usando as opcoes do script original.")
+          PY
+          bash -n build/wineserver/bootstrap-ci.sh
+          command -v llvm-objcopy
+
+      - name: Compilar base do wineserver
+        run: |
+          bash build/wineserver/bootstrap-ci.sh 2>&1 | tee reports/wineserver-base.log
+
+      - name: Compilar adaptacoes iOS e montar wineserver
+        run: |
+          bash build/wineserver/build.sh 2>&1 | tee reports/wineserver-ios.log
+          test -s app/Madeira/libwineserver.a
+          xcrun lipo -info app/Madeira/libwineserver.a | tee reports/wineserver-arquitetura.txt
+          ar -t app/Madeira/libwineserver.a | tee reports/wineserver-objetos.txt
+          grep -Fx 'main_ios.o' reports/wineserver-objetos.txt
+          grep -Fx 'request_ios.o' reports/wineserver-objetos.txt
+          grep -Fx 'wineserver_ios_kill.o' reports/wineserver-objetos.txt
+          xcrun nm -g app/Madeira/libwineserver.a > reports/wineserver-simbolos.txt
+          echo 'Biblioteca wineserver compilada desde as fontes. Ainda precisa ser vinculada ao aplicativo e testada no iPad.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Salvar wineserver compilado
+        uses: actions/upload-artifact@v7
+        with:
+          name: wineserver-ios
+          path: app/Madeira/libwineserver.a
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Salvar relatorios mesmo em caso de erro
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: relatorios-wineserver
+          retention-days: 7
+          path: |
+            reports/
+            wine/build-macos/config.log
+            build/wineserver/obj/err-*.txt
